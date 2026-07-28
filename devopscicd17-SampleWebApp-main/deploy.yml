@@ -1,230 +1,351 @@
-name: Build, Scan & Deploy Docker to EC2 via ECR
+# =============================================================================
+# GitLab CI/CD — Build, Scan & Deploy WebApp to GKE via Google Artifact Registry
+# Project: devopscicd17-SampleWebApp
+#
+# ⚠️  REQUIRED GOOGLE CLOUD INPUTS (Settings → CI/CD → Variables):
+#
+#   GCP_SA_KEY          → Base64-encoded GCP Service Account JSON key
+#                         Roles needed:
+#                           - roles/artifactregistry.writer
+#                           - roles/storage.objectAdmin
+#                           - roles/container.developer   (for GKE deploy)
+#   GCP_PROJECT_ID      → GCP project ID              e.g. my-project-123456
+#   GCP_REGION          → Artifact Registry region    e.g. us-central1
+#   GAR_REPO_NAME       → GAR repository name         e.g. my-app-repo
+#   GAR_IMAGE_NAME      → Docker image name           e.g. webapp
+#   GKE_CLUSTER_NAME    → GKE cluster name            e.g. my-gke-cluster
+#   GKE_CLUSTER_ZONE    → GKE cluster zone            e.g. us-central1-a
+#   GCS_BUCKET          → GCS bucket for scan reports e.g. my-security-scans
+#   GCE_HOST            → External IP of GKE ingress / LB (for ZAP DAST scan)
+#
+#   PRISMA_API_KEY      → Prisma Cloud API key (Checkov)
+#   PRISMA_ACCESS_KEY   → Prisma Cloud twistcli access key
+#   PRISMA_SECRET_KEY   → Prisma Cloud twistcli secret key
+#   PRISMA_CONSOLE_URL  → Prisma Cloud console URL
+#   SONAR_TOKEN         → SonarCloud authentication token
+#   SNYK_TOKEN          → Snyk authentication token
+#
+# =============================================================================
 
-on:
-  push:
-    branches: ["main"]
+stages:
+  - checkout-scan    # Prisma / Checkov IaC + code scan
+  - build            # Maven WAR + Docker image build
+  - security-scans   # TruffleHog, SonarCloud, Snyk, Prisma twistcli, OWASP ZAP
+  - push             # Push Docker image to Google Artifact Registry
+  - deploy           # Deploy to GKE via kubectl
+  - upload-reports   # Upload all scan reports to Google Cloud Storage
 
-jobs:
+# ---------------------------------------------------------------------------
+# Default image
+# ---------------------------------------------------------------------------
+default:
+  image: google/cloud-sdk:alpine
 
-  deploy:
-    runs-on: ubuntu-latest
+# ---------------------------------------------------------------------------
+# Reusable GCP auth anchor
+# ---------------------------------------------------------------------------
+.gcp-auth: &gcp-auth
+  - echo "$GCP_SA_KEY" | base64 -d > /tmp/sa-key.json
+  - gcloud auth activate-service-account --key-file=/tmp/sa-key.json
+  - gcloud config set project "$GCP_PROJECT_ID"
+  - gcloud auth configure-docker "${GCP_REGION}-docker.pkg.dev" --quiet
 
-    steps:
+# ---------------------------------------------------------------------------
+# STAGE: checkout-scan — Prisma / Checkov IaC + Code scan
+# ---------------------------------------------------------------------------
+prisma-code-scan:
+  stage: checkout-scan
+  image: python:3.11-slim
+  before_script:
+    - pip install --quiet checkov
+  script:
+    - |
+      checkov -d . \
+        --bc-api-key "$PRISMA_API_KEY" \
+        --output json \
+        --output-file-path . \
+        || true
+    - |
+      if [ -f results_checkov.json ]; then
+        mv results_checkov.json prisma-code-scan.json
+      elif [ -f results.json ]; then
+        mv results.json prisma-code-scan.json
+      fi
+  allow_failure: true
+  artifacts:
+    when: always
+    paths:
+      - prisma-code-scan.json
+    expire_in: 7 days
 
-      # ---------------------------------------------------------
-      # CHECKOUT (Full history for TruffleHog)
-      # ---------------------------------------------------------
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+# ---------------------------------------------------------------------------
+# STAGE: build — Maven WAR build
+# ---------------------------------------------------------------------------
+maven-build:
+  stage: build
+  image: maven:3.9-eclipse-temurin-17
+  cache:
+    key: maven-$CI_COMMIT_REF_SLUG
+    paths:
+      - .m2/repository
+  variables:
+    MAVEN_OPTS: "-Dmaven.repo.local=.m2/repository"
+  script:
+    - mvn -B clean package --file pom.xml
+    - echo "Build complete — WAR at target/WebApp.war"
+  artifacts:
+    paths:
+      - target/WebApp.war
+    expire_in: 1 day
 
-      # ---------------------------------------------------------
-      # PRISMA CODE REPO SCAN (Checkov - SAST + IaC)
-      # ---------------------------------------------------------
-      - name: Run Prisma Code Repo Scan (Checkov)
-        uses: bridgecrewio/checkov-action@v12
-        with:
-          api-key: ${{ secrets.PRISMA_API_KEY }}
-          directory: .
-          output_format: json
-          output_file_path: .
-        continue-on-error: true
+# ---------------------------------------------------------------------------
+# STAGE: security-scans
+# ---------------------------------------------------------------------------
 
-      - name: Rename Prisma Code Scan Report
-        run: |
-          if [ -f results.json ]; then
-            mv results.json prisma-code-scan.json
-          fi
-        continue-on-error: true
+# TruffleHog — Secrets scan
+trufflehog-scan:
+  stage: security-scans
+  image: python:3.11-slim
+  before_script:
+    - pip install --quiet "trufflehog==2.2.1"
+  script:
+    - trufflehog filesystem . --json > trufflehog-results.json || echo "TruffleHog scan failed, continuing..."
+  allow_failure: true
+  artifacts:
+    when: always
+    paths:
+      - trufflehog-results.json
+    expire_in: 7 days
 
-      # ---------------------------------------------------------
-      # BUILD (Maven)
-      # ---------------------------------------------------------
-      - name: Set up Java
-        uses: actions/setup-java@v3
-        with:
-          java-version: "17"
-          distribution: "temurin"
+# SonarCloud — SAST
+# ⚠️  sonar-project.properties already contains projectKey and organization
+sonarcloud-scan:
+  stage: security-scans
+  image: sonarsource/sonar-scanner-cli:latest
+  variables:
+    GIT_DEPTH: "0"
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
+  script:
+    - sonar-scanner
+        -Dsonar.host.url="https://sonarcloud.io"
+        -Dsonar.login="$SONAR_TOKEN"
+        || true
+    - echo '{"note":"SonarCloud results stored on SonarCloud dashboard"}' > sonar-report.json
+  allow_failure: true
+  artifacts:
+    when: always
+    paths:
+      - sonar-report.json
+    expire_in: 7 days
 
-      - name: Build WAR using Maven
-        run: mvn -B clean package --file pom.xml
+# Snyk — SCA + SAST + Container scan
+snyk-scans:
+  stage: security-scans
+  image: docker:24
+  services:
+    - docker:24-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  before_script:
+    - apk add --no-cache curl nodejs npm
+    - npm install -g snyk
+    - snyk auth "$SNYK_TOKEN"
+  script:
+    - snyk test --json --severity-threshold=high > snyk-sca.json || echo "Snyk SCA failed, continuing..."
+    - snyk code test --json --severity-threshold=high > snyk-sast.json || echo "Snyk SAST failed, continuing..."
+    - docker build -t webapp:latest .
+    - snyk container test webapp:latest --json --severity-threshold=high > snyk-container.json || echo "Snyk container scan failed, continuing..."
+  allow_failure: true
+  artifacts:
+    when: always
+    paths:
+      - snyk-sca.json
+      - snyk-sast.json
+      - snyk-container.json
+    expire_in: 7 days
 
-      # ===========================================================
-      # SECURITY SCANS (TruffleHog / SonarCloud / Snyk / Prisma / ZAP)
-      # ===========================================================
+# Prisma Cloud — twistcli container scan
+prisma-container-scan:
+  stage: security-scans
+  image: docker:24
+  services:
+    - docker:24-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  before_script:
+    - apk add --no-cache curl
+    - docker build -t webapp:latest .
+  script:
+    - |
+      curl -u "${PRISMA_ACCESS_KEY}:${PRISMA_SECRET_KEY}" \
+        --output twistcli \
+        "${PRISMA_CONSOLE_URL}/api/v1/util/twistcli"
+      chmod +x twistcli
+    - |
+      ./twistcli images scan \
+        --address "${PRISMA_CONSOLE_URL}" \
+        --user "${PRISMA_ACCESS_KEY}" \
+        --password "${PRISMA_SECRET_KEY}" \
+        --output-file prisma-scan.json \
+        webapp:latest || echo "Prisma scan failed, continuing..."
+  allow_failure: true
+  artifacts:
+    when: always
+    paths:
+      - prisma-scan.json
+    expire_in: 7 days
 
-      # TRUFFLEHOG (Secrets Scan)
-      - name: Install TruffleHog
-        run: pip install trufflehog==2.2.1
-        continue-on-error: true
+# OWASP ZAP — DAST baseline scan
+# ⚠️  GCE_HOST = external IP assigned by the GKE LoadBalancer service
+#               (get it with: kubectl get svc devops-training-app-service)
+zap-dast-scan:
+  stage: security-scans
+  image: ghcr.io/zaproxy/zaproxy:stable
+  script:
+    - |
+      zap-baseline.py \
+        -t "http://${GCE_HOST}" \
+        -a \
+        -J zap-report.json \
+        -w zap-report.md \
+        -r zap-report.html \
+        || true
+  allow_failure: true
+  artifacts:
+    when: always
+    paths:
+      - zap-report.html
+      - zap-report.json
+      - zap-report.md
+    expire_in: 7 days
 
-      - name: Run TruffleHog Secrets Scan
-        run: |
-          trufflehog filesystem . --json > trufflehog-results.json || echo "TruffleHog scan failed, continuing..."
-        continue-on-error: true
+# ---------------------------------------------------------------------------
+# STAGE: push — Build & push to Google Artifact Registry
+#
+# ⚠️  Pre-create the GAR repository once:
+#   gcloud artifacts repositories create $GAR_REPO_NAME \
+#     --repository-format=docker \
+#     --location=$GCP_REGION \
+#     --project=$GCP_PROJECT_ID
+#
+# Image URL: GCP_REGION-docker.pkg.dev/GCP_PROJECT_ID/GAR_REPO_NAME/GAR_IMAGE_NAME:TAG
+# ---------------------------------------------------------------------------
+push-to-gar:
+  stage: push
+  image: docker:24
+  services:
+    - docker:24-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  before_script:
+    - apk add --no-cache python3 py3-pip curl bash
+    - curl -sSL https://sdk.cloud.google.com | bash -s -- --disable-prompts --install-dir=/usr/local
+    - export PATH="/usr/local/google-cloud-sdk/bin:$PATH"
+    - *gcp-auth
+  script:
+    - |
+      GAR_URL="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${GAR_REPO_NAME}/${GAR_IMAGE_NAME}"
 
-      # SONARCLOUD (SAST)
-      - name: SonarCloud Scan
-        uses: SonarSource/sonarcloud-github-action@v2
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
-        with:
-          projectBaseDir: .
-        continue-on-error: true
+      docker build -t webapp:latest .
+      docker tag webapp:latest "${GAR_URL}:latest"
+      docker tag webapp:latest "${GAR_URL}:${CI_COMMIT_SHORT_SHA}"
+      docker push "${GAR_URL}:latest"
+      docker push "${GAR_URL}:${CI_COMMIT_SHORT_SHA}"
 
-      - name: Export SonarCloud Raw Report
-        run: |
-          echo '{"note": "SonarCloud results stored on cloud dashboard"}' > sonar-report.json
-        continue-on-error: true
+      echo "GAR_URL=${GAR_URL}" >> build.env
+      echo "IMAGE_TAG=${CI_COMMIT_SHORT_SHA}" >> build.env
+  artifacts:
+    reports:
+      dotenv: build.env
+  only:
+    - main
 
-      # SNYK (SCA + SAST + Container Scan)
-      - name: Install Snyk CLI
-        uses: snyk/actions/setup@v1
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        continue-on-error: true
+# ---------------------------------------------------------------------------
+# STAGE: deploy — Deploy to GKE via kubectl
+#
+# ⚠️  Pre-requisites:
+#   1. GKE cluster already exists:
+#      gcloud container clusters create $GKE_CLUSTER_NAME \
+#        --zone $GKE_CLUSTER_ZONE --project $GCP_PROJECT_ID
+#   2. GKE nodes service account has roles/artifactregistry.reader
+#   3. The SA in GCP_SA_KEY has roles/container.developer
+# ---------------------------------------------------------------------------
+deploy-to-gke:
+  stage: deploy
+  image: google/cloud-sdk:alpine
+  before_script:
+    - *gcp-auth
+    - gcloud components install kubectl --quiet
+    # Get GKE credentials into ~/.kube/config
+    - gcloud container clusters get-credentials "$GKE_CLUSTER_NAME"
+        --zone "$GKE_CLUSTER_ZONE"
+        --project "$GCP_PROJECT_ID"
+  script:
+    - |
+      GAR_URL="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${GAR_REPO_NAME}/${GAR_IMAGE_NAME}"
 
-      - name: Snyk SCA Scan
-        run: |
-          snyk test --json --severity-threshold=high > snyk-sca.json || echo "Snyk SCA scan failed, continuing..."
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        continue-on-error: true
+      # Substitute image path and tag placeholders in deployment.yaml
+      sed -i "s|GCP_REGION-docker.pkg.dev/GCP_PROJECT_ID/GAR_REPO_NAME/GAR_IMAGE_NAME|${GAR_URL}|g" deployment.yaml
+      sed -i "s|docker_tag|${CI_COMMIT_SHORT_SHA}|g" deployment.yaml
 
-      - name: Snyk SAST Scan
-        run: |
-          snyk code test --json --severity-threshold=high > snyk-sast.json || echo "Snyk SAST scan failed, continuing..."
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        continue-on-error: true
+      kubectl delete -f deployment.yaml --ignore-not-found=true
+      kubectl apply  -f deployment.yaml
 
-      - name: Build Docker Image for Snyk Container Scan
-        run: docker build -t app:latest .
-        continue-on-error: true
+      echo "Waiting for rollout to complete..."
+      kubectl rollout status deployment/devops-training --timeout=120s
+  only:
+    - main
 
-      - name: Snyk Container Scan
-        run: |
-          snyk container test app:latest --json --severity-threshold=high > snyk-container.json || echo "Snyk container scan failed, continuing..."
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        continue-on-error: true
+# ---------------------------------------------------------------------------
+# STAGE: upload-reports — Upload all scan artefacts to Google Cloud Storage
+#
+# ⚠️  Pre-create the GCS bucket:
+#   gsutil mb -l $GCP_REGION gs://$GCS_BUCKET
+#   Grant: roles/storage.objectAdmin to the SA
+# ---------------------------------------------------------------------------
+upload-reports-to-gcs:
+  stage: upload-reports
+  image: google/cloud-sdk:alpine
+  before_script:
+    - *gcp-auth
+  script:
+    - |
+      GCS_PATH="gs://${GCS_BUCKET}/security-scans/run-${CI_PIPELINE_ID}/"
 
-      # PRISMA CLOUD — twistcli Container Scan
-      - name: Download twistcli
-        run: |
-          curl -u "${{ secrets.PRISMA_ACCESS_KEY }}:${{ secrets.PRISMA_SECRET_KEY }}" \
-            --output twistcli \
-            "${{ secrets.PRISMA_CONSOLE_URL }}/api/v1/util/twistcli"
-          chmod +x twistcli
-        continue-on-error: true
+      REPORTS=(
+        prisma-code-scan.json
+        trufflehog-results.json
+        snyk-sca.json
+        snyk-sast.json
+        snyk-container.json
+        prisma-scan.json
+        sonar-report.json
+        zap-report.html
+        zap-report.json
+        zap-report.md
+      )
 
-      - name: Prisma Cloud Scan
-        run: |
-          ./twistcli images scan \
-            --address ${{ secrets.PRISMA_CONSOLE_URL }} \
-            --user ${{ secrets.PRISMA_ACCESS_KEY }} \
-            --password ${{ secrets.PRISMA_SECRET_KEY }} \
-            --output-file prisma-scan.json \
-            app:latest || echo "Prisma scan failed, continuing..."
-        continue-on-error: true
+      # Save pipeline metadata as log
+      echo "Pipeline ID   : ${CI_PIPELINE_ID}"        > logs.txt
+      echo "Pipeline URL  : ${CI_PIPELINE_URL}"       >> logs.txt
+      echo "Commit SHA    : ${CI_COMMIT_SHA}"         >> logs.txt
+      echo "Branch        : ${CI_COMMIT_REF_NAME}"    >> logs.txt
+      echo "Project       : ${CI_PROJECT_PATH}"       >> logs.txt
+      echo "Runner        : ${CI_RUNNER_DESCRIPTION}" >> logs.txt
+      ls -lah >> logs.txt
+      REPORTS+=("logs.txt")
 
-      # OWASP ZAP Baseline Scan (DAST)
-      - name: Run OWASP ZAP Baseline Scan
-        uses: zaproxy/action-baseline@v0.10.0
-        with:
-          target: "http://${{ secrets.EC2_HOST }}"
-          cmd_options: "-a"
-        continue-on-error: true
+      echo "Uploading reports to ${GCS_PATH}"
+      for file in "${REPORTS[@]}"; do
+        if [ -f "$file" ]; then
+          gsutil cp "$file" "${GCS_PATH}"
+          echo "Uploaded: $file"
+        else
+          echo "Warning: $file not found, skipping..."
+        fi
+      done
 
-      - name: Rename ZAP reports
-        run: |
-          mv report_html.html zap-report.html || true
-          mv report_json.json zap-report.json || true
-          mv report_md.md zap-report.md || true
-        continue-on-error: true
-
-      # ===========================================================
-      # AWS LOGIN + PUSH TO ECR
-      # ===========================================================
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
-
-      - name: Login to Amazon ECR
-        uses: aws-actions/amazon-ecr-login@v1
-
-      - name: Push Image to ECR
-        run: |
-          ECR_URL="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com"
-          IMAGE_NAME="${{ secrets.ECR_REPO_NAME }}"
-          TAG="latest"
-
-          docker tag app:latest $ECR_URL/$IMAGE_NAME:$TAG
-          docker push $ECR_URL/$IMAGE_NAME:$TAG
-
-      # ===========================================================
-      # DEPLOYMENT ON EC2 (Container Restart)
-      # ===========================================================
-      - name: Deploy on EC2
-        uses: appleboy/ssh-action@v0.1.7
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USER }}
-          key: ${{ secrets.EC2_SSH_KEY }}
-          script: |
-            ECR_URL="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com"
-            IMAGE_NAME="${{ secrets.ECR_REPO_NAME }}"
-            TAG="latest"
-
-            sudo docker pull $ECR_URL/$IMAGE_NAME:$TAG
-            sudo docker stop app || true
-            sudo docker rm app || true
-            sudo docker run -d --name app -p 80:8080 $ECR_URL/$IMAGE_NAME:$TAG
-
-      # ===========================================================
-      # UPLOAD ALL SCAN REPORTS + PIPELINE LOGS TO S3
-      # ===========================================================
-      - name: Save pipeline logs locally
-        run: |
-          echo "Run ID: $GITHUB_RUN_ID" > logs.txt
-          echo "Repository: $GITHUB_REPOSITORY" >> logs.txt
-          ls -lah >> logs.txt
-
-      - name: Upload all scan reports and logs to S3
-        run: |
-          S3="s3://cf-templates-efzoo91lt857-us-east-1/security-scans/run-$GITHUB_RUN_ID/"
-
-          REPORTS=(
-            prisma-code-scan.json
-            trufflehog-results.json
-            snyk-sca.json
-            snyk-sast.json
-            snyk-container.json
-            prisma-scan.json
-            sonar-report.json
-            zap-report.html
-            zap-report.json
-            zap-report.md
-            logs.txt
-          )
-
-          echo "Uploading to $S3"
-          for file in "${REPORTS[@]}"; do
-            if [ -f "$file" ]; then
-              aws s3 cp "$file" "$S3"
-              echo "Uploaded $file"
-            else
-              echo "Warning: $file not found, skipping..."
-            fi
-          done
-
-          echo "All available security reports uploaded to S3."
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
+      echo "All available security reports uploaded to GCS."
+  when: always
+  only:
+    - main
