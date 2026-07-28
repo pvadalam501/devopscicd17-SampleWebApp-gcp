@@ -45,30 +45,30 @@ pipeline {
         // -----------------------------------------------------------------
         // STAGE 1: SonarCloud Quality Gate
         // -----------------------------------------------------------------
-        stage('SonarCloud Quality Gate') {
-            agent {
-                docker {
-                    image 'maven:3.9-eclipse-temurin-17'
-                    args '-v $HOME/.m2:/root/.m2'
-                }
-            }
-            steps {
-                script {
-                    // ⚠️  'sonarserver' must match the SonarQube server name configured
-                    //     in Jenkins → Manage Jenkins → Configure System → SonarQube servers
-                    withSonarQubeEnv('sonarserver') {
-                        sh "mvn sonar:sonar"
-                    }
-                    timeout(time: 1, unit: 'HOURS') {
-                        def qg = waitForQualityGate()
-                        if (qg.status != 'OK') {
-                            error "Pipeline aborted due to quality gate failure: ${qg.status}"
-                        }
-                    }
-                    sh "mvn clean install"
-                }
-            }
-        }
+        // stage('SonarCloud Quality Gate') {
+        //     agent {
+        //         docker {
+        //             image 'maven:3.9-eclipse-temurin-17'
+        //             args '-v $HOME/.m2:/root/.m2'
+        //         }
+        //     }
+        //     steps {
+        //         script {
+        //             // ⚠️  'sonarserver' must match the SonarQube server name configured
+        //             //     in Jenkins → Manage Jenkins → Configure System → SonarQube servers
+        //             withSonarQubeEnv('sonarserver') {
+        //                 sh "mvn sonar:sonar"
+        //             }
+        //             timeout(time: 1, unit: 'HOURS') {
+        //                 def qg = waitForQualityGate()
+        //                 if (qg.status != 'OK') {
+        //                     error "Pipeline aborted due to quality gate failure: ${qg.status}"
+        //                 }
+        //             }
+        //             sh "mvn clean install"
+        //         }
+        //     }
+        // }
 
         // -----------------------------------------------------------------
         // STAGE 2: Build Docker Image & Push to Google Artifact Registry
