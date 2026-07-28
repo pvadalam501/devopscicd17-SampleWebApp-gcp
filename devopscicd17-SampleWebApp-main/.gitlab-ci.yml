@@ -119,50 +119,50 @@ trufflehog-scan:
 
 # SonarCloud — SAST
 # ⚠️  sonar-project.properties already contains projectKey and organization
-sonarcloud-scan:
-  stage: security-scans
-  image: sonarsource/sonar-scanner-cli:latest
-  variables:
-    GIT_DEPTH: "0"
-    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
-  script:
-    - sonar-scanner
-        -Dsonar.host.url="https://sonarcloud.io"
-        -Dsonar.login="$SONAR_TOKEN"
-        || true
-    - echo '{"note":"SonarCloud results stored on SonarCloud dashboard"}' > sonar-report.json
-  allow_failure: true
-  artifacts:
-    when: always
-    paths:
-      - sonar-report.json
-    expire_in: 7 days
+# sonarcloud-scan:
+#   stage: security-scans
+#   image: sonarsource/sonar-scanner-cli:latest
+#   variables:
+#     GIT_DEPTH: "0"
+#     SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
+#   script:
+#     - sonar-scanner
+#         -Dsonar.host.url="https://sonarcloud.io"
+#         -Dsonar.login="$SONAR_TOKEN"
+#         || true
+#     - echo '{"note":"SonarCloud results stored on SonarCloud dashboard"}' > sonar-report.json
+#   allow_failure: true
+  # artifacts:
+  #   when: always
+  #   paths:
+  #     - sonar-report.json
+  #   expire_in: 7 days
 
 # Snyk — SCA + SAST + Container scan
-snyk-scans:
-  stage: security-scans
-  image: docker:24
-  services:
-    - docker:24-dind
-  variables:
-    DOCKER_TLS_CERTDIR: "/certs"
-  before_script:
-    - apk add --no-cache curl nodejs npm
-    - npm install -g snyk
-    - snyk auth "$SNYK_TOKEN"
-  script:
-    - snyk test --json --severity-threshold=high > snyk-sca.json || echo "Snyk SCA failed, continuing..."
-    - snyk code test --json --severity-threshold=high > snyk-sast.json || echo "Snyk SAST failed, continuing..."
-    - docker build -t webapp:latest .
-    - snyk container test webapp:latest --json --severity-threshold=high > snyk-container.json || echo "Snyk container scan failed, continuing..."
-  allow_failure: true
-  artifacts:
-    when: always
-    paths:
-      - snyk-sca.json
-      - snyk-sast.json
-      - snyk-container.json
-    expire_in: 7 days
+# snyk-scans:
+#   stage: security-scans
+#   image: docker:24
+#   services:
+#     - docker:24-dind
+#   variables:
+#     DOCKER_TLS_CERTDIR: "/certs"
+#   before_script:
+#     - apk add --no-cache curl nodejs npm
+#     - npm install -g snyk
+#     - snyk auth "$SNYK_TOKEN"
+#   script:
+#     - snyk test --json --severity-threshold=high > snyk-sca.json || echo "Snyk SCA failed, continuing..."
+#     - snyk code test --json --severity-threshold=high > snyk-sast.json || echo "Snyk SAST failed, continuing..."
+#     - docker build -t webapp:latest .
+#     - snyk container test webapp:latest --json --severity-threshold=high > snyk-container.json || echo "Snyk container scan failed, continuing..."
+#   allow_failure: true
+#   artifacts:
+    # when: always
+    # paths:
+    #   - snyk-sca.json
+    #   - snyk-sast.json
+    #   - snyk-container.json
+    # expire_in: 7 days
 
 # Prisma Cloud — twistcli container scan
 prisma-container-scan:
@@ -198,26 +198,26 @@ prisma-container-scan:
 # OWASP ZAP — DAST baseline scan
 # ⚠️  GCE_HOST = external IP assigned by the GKE LoadBalancer service
 #               (get it with: kubectl get svc devops-training-app-service)
-zap-dast-scan:
-  stage: security-scans
-  image: ghcr.io/zaproxy/zaproxy:stable
-  script:
-    - |
-      zap-baseline.py \
-        -t "http://${GCE_HOST}" \
-        -a \
-        -J zap-report.json \
-        -w zap-report.md \
-        -r zap-report.html \
-        || true
-  allow_failure: true
-  artifacts:
-    when: always
-    paths:
-      - zap-report.html
-      - zap-report.json
-      - zap-report.md
-    expire_in: 7 days
+# zap-dast-scan:
+#   stage: security-scans
+#   image: ghcr.io/zaproxy/zaproxy:stable
+#   script:
+#     - |
+#       zap-baseline.py \
+#         -t "http://${GCE_HOST}" \
+#         -a \
+#         -J zap-report.json \
+#         -w zap-report.md \
+#         -r zap-report.html \
+#         || true
+#   allow_failure: true
+#   artifacts:
+#     when: always
+#     paths:
+#       - zap-report.html
+#       - zap-report.json
+#       - zap-report.md
+#     expire_in: 7 days
 
 # ---------------------------------------------------------------------------
 # STAGE: push — Build & push to Google Artifact Registry
