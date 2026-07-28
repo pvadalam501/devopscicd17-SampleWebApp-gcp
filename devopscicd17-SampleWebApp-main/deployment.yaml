@@ -1,0 +1,69 @@
+# =============================================================================
+# GKE Deployment & Service manifest
+#
+# ⚠️  REQUIRED GCP INPUTS — replace placeholders before applying:
+#
+#   GCP_REGION      → Artifact Registry region          e.g. us-central1
+#   GCP_PROJECT_ID  → Your GCP project ID               e.g. my-project-123456
+#   GAR_REPO_NAME   → Artifact Registry repository name e.g. my-app-repo
+#   GAR_IMAGE_NAME  → Docker image name                 e.g. webapp
+#   IMAGE_TAG       → Git commit SHA or "latest"
+#
+# Full image URL format:
+#   GCP_REGION-docker.pkg.dev/GCP_PROJECT_ID/GAR_REPO_NAME/GAR_IMAGE_NAME:IMAGE_TAG
+#
+# The CI/CD pipeline (gitlab-ci.yml) substitutes the image field automatically.
+# =============================================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: devops-training
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: devops-training
+  template:
+    metadata:
+      labels:
+        app: devops-training
+    spec:
+      # ⚠️  imagePullSecrets not needed if GKE nodes use Workload Identity
+      #     with roles/artifactregistry.reader on the GAR repo.
+      containers:
+      - name: devops-training
+        # ⚠️  Replace this image path with your actual GAR URL + tag
+        # Format: GCP_REGION-docker.pkg.dev/GCP_PROJECT_ID/GAR_REPO_NAME/GAR_IMAGE_NAME:docker_tag
+        image: GCP_REGION-docker.pkg.dev/GCP_PROJECT_ID/GAR_REPO_NAME/GAR_IMAGE_NAME:docker_tag
+        ports:
+        - name: http
+          containerPort: 8080
+        # Removed the startup.sh while-loop workaround — Tomcat CMD handles this correctly
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+
+---
+# Service: LoadBalancer (GKE provisions a Google Cloud L4 Network Load Balancer)
+# ⚠️  Changed from NodePort (EC2-style) to LoadBalancer — GKE natively provisions
+#     a Google Cloud Load Balancer and assigns an external IP automatically.
+apiVersion: v1
+kind: Service
+metadata:
+  name: devops-training-app-service
+  labels:
+    app: devops-training
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 80
+    targetPort: 8080
+    protocol: TCP
+    name: http
+  selector:
+    app: devops-training

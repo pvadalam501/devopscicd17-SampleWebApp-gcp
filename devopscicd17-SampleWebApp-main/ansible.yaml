@@ -1,0 +1,53 @@
+# =============================================================================
+# Ansible Playbook — Deploy to GKE via gcloud kubectl
+#
+# ⚠️  REQUIRED GCP INPUTS (set in hosts file or passed as extra-vars):
+#
+#   gcp_project_id     → GCP project ID           e.g. my-project-123456
+#   gke_cluster_name   → GKE cluster name          e.g. my-gke-cluster
+#   gke_cluster_zone   → GKE cluster zone          e.g. us-central1-a
+#
+# ⚠️  The control node (machine running Ansible) must have:
+#   - gcloud CLI installed and authenticated (gcloud auth login or SA key)
+#   - kubectl installed (gcloud components install kubectl)
+#
+# Usage:
+#   ansible-playbook -i hosts ansible.yaml \
+#     --extra-vars "gcp_project_id=my-project gke_cluster_name=my-cluster gke_cluster_zone=us-central1-a"
+# =============================================================================
+
+- hosts: gke_deploy
+  gather_facts: false
+  vars:
+    # ⚠️  Override these via --extra-vars or inventory group_vars
+    gcp_project_id: "GCP_PROJECT_ID"
+    gke_cluster_name: "GKE_CLUSTER_NAME"
+    gke_cluster_zone: "GKE_CLUSTER_ZONE"
+    deployment_file: "deployment.yaml"
+
+  tasks:
+
+    - name: Authenticate gcloud with service account key
+      # ⚠️  Set GCP_SA_KEY_PATH to the path of your service account JSON key on the control node
+      command: gcloud auth activate-service-account --key-file="{{ lookup('env','GCP_SA_KEY_PATH') }}"
+      ignore_errors: true
+
+    - name: Set active GCP project
+      command: gcloud config set project "{{ gcp_project_id }}"
+
+    - name: Get GKE cluster credentials (populates ~/.kube/config)
+      command: >
+        gcloud container clusters get-credentials "{{ gke_cluster_name }}"
+        --zone "{{ gke_cluster_zone }}"
+        --project "{{ gcp_project_id }}"
+
+    - name: Copy deployment manifest to remote (if deploying from a remote node)
+      copy:
+        src: "{{ deployment_file }}"
+        dest: /tmp/deployment.yaml
+
+    - name: Delete previous Kubernetes objects (rolling delete)
+      command: kubectl delete -f /tmp/deployment.yaml --ignore-not-found=true
+
+    - name: Apply updated Kubernetes deployment
+      command: kubectl apply -f /tmp/deployment.yaml

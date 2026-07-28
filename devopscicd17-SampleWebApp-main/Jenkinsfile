@@ -1,0 +1,142 @@
+// =============================================================================
+// Jenkinsfile — Build, Scan & Deploy to GKE via Google Artifact Registry
+//
+// ⚠️  REQUIRED JENKINS CREDENTIALS (Manage Jenkins → Credentials):
+//
+//   gcp-sa-key          → Secret file: GCP Service Account JSON key
+//                         (Roles: Artifact Registry Writer, GKE Developer)
+//   sonar-token         → Secret text: SonarCloud authentication token
+//   snyk-token          → Secret text: Snyk authentication token
+//
+// ⚠️  REQUIRED JENKINS GLOBAL ENV VARS (Manage Jenkins → System → Global properties):
+//
+//   GCP_PROJECT_ID      → GCP project ID                e.g. my-project-123456
+//   GCP_REGION          → Artifact Registry region      e.g. us-central1
+//   GAR_REPO_NAME       → Artifact Registry repo name   e.g. my-app-repo
+//   GAR_IMAGE_NAME      → Docker image name             e.g. webapp
+//   GKE_CLUSTER_NAME    → GKE cluster name              e.g. my-gke-cluster
+//   GKE_CLUSTER_ZONE    → GKE cluster zone              e.g. us-central1-a
+//
+// ⚠️  Jenkins agent must have installed:
+//   - gcloud CLI  (gcloud components install kubectl)
+//   - Docker
+//   - Maven (or use the maven Docker image agent per stage)
+//   - Ansible
+// =============================================================================
+
+currentBuild.displayName = "GCP_Deploy # " + currentBuild.number
+
+def getDockerTag() {
+    def tag = sh script: 'git rev-parse --short HEAD', returnStdout: true
+    return tag.trim()
+}
+
+pipeline {
+    agent any
+
+    environment {
+        DOCKER_TAG   = getDockerTag()
+        GAR_URL      = "${env.GCP_REGION}-docker.pkg.dev/${env.GCP_PROJECT_ID}/${env.GAR_REPO_NAME}/${env.GAR_IMAGE_NAME}"
+        FULL_IMAGE   = "${GAR_URL}:${DOCKER_TAG}"
+    }
+
+    stages {
+
+        // -----------------------------------------------------------------
+        // STAGE 1: SonarCloud Quality Gate
+        // -----------------------------------------------------------------
+        stage('SonarCloud Quality Gate') {
+            agent {
+                docker {
+                    image 'maven:3.9-eclipse-temurin-17'
+                    args '-v $HOME/.m2:/root/.m2'
+                }
+            }
+            steps {
+                script {
+                    // ⚠️  'sonarserver' must match the SonarQube server name configured
+                    //     in Jenkins → Manage Jenkins → Configure System → SonarQube servers
+                    withSonarQubeEnv('sonarserver') {
+                        sh "mvn sonar:sonar"
+                    }
+                    timeout(time: 1, unit: 'HOURS') {
+                        def qg = waitForQualityGate()
+                        if (qg.status != 'OK') {
+                            error "Pipeline aborted due to quality gate failure: ${qg.status}"
+                        }
+                    }
+                    sh "mvn clean install"
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // STAGE 2: Build Docker Image & Push to Google Artifact Registry
+        // -----------------------------------------------------------------
+        stage('Build & Push to GAR') {
+            steps {
+                script {
+                    withCredentials([file(credentialsId: 'gcp-sa-key', variable: 'SA_KEY_FILE')]) {
+                        sh """
+                            # Authenticate gcloud with the service account
+                            gcloud auth activate-service-account --key-file=\$SA_KEY_FILE
+                            gcloud config set project ${env.GCP_PROJECT_ID}
+
+                            # Configure Docker to use gcloud credentials for GAR
+                            gcloud auth configure-docker ${env.GCP_REGION}-docker.pkg.dev --quiet
+
+                            # Build image
+                            docker build -t ${FULL_IMAGE} .
+
+                            # Push image to Google Artifact Registry
+                            docker push ${FULL_IMAGE}
+
+                            # Also tag and push as :latest
+                            docker tag ${FULL_IMAGE} ${GAR_URL}:latest
+                            docker push ${GAR_URL}:latest
+                        """
+                    }
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // STAGE 3: Deploy to GKE via Ansible
+        // -----------------------------------------------------------------
+        stage('Deploy to GKE via Ansible') {
+            steps {
+                script {
+                    // Substitute the docker_tag placeholder in deployment.yaml
+                    sh """
+                        sed -i "s|docker_tag|${DOCKER_TAG}|g" deployment.yaml
+                        # ⚠️  Also substitute the full GAR image path placeholder
+                        sed -i "s|GCP_REGION-docker.pkg.dev/GCP_PROJECT_ID/GAR_REPO_NAME/GAR_IMAGE_NAME|${GAR_URL}|g" deployment.yaml
+                    """
+
+                    // Run the Ansible playbook to deploy to GKE
+                    // ⚠️  'ansible' must be the Ansible installation name in
+                    //     Jenkins → Manage Jenkins → Global Tool Configuration
+                    ansiblePlaybook(
+                        become: true,
+                        installation: 'ansible',
+                        inventory: 'hosts',
+                        playbook: 'ansible.yaml',
+                        extras: "--extra-vars \"gcp_project_id=${env.GCP_PROJECT_ID} gke_cluster_name=${env.GKE_CLUSTER_NAME} gke_cluster_zone=${env.GKE_CLUSTER_ZONE}\""
+                    )
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            cleanWs()
+        }
+        success {
+            echo "✅ Deployment to GKE successful. Image: ${FULL_IMAGE}"
+        }
+        failure {
+            echo "❌ Pipeline failed. Check logs above."
+        }
+    }
+}

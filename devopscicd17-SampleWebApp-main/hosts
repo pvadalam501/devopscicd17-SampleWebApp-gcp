@@ -1,0 +1,26 @@
+# =============================================================================
+# Ansible Inventory — Google Cloud
+#
+# ⚠️  REQUIRED GCP INPUTS — replace placeholders below:
+#
+#   GCE_INSTANCE_EXTERNAL_IP  → External IP of your Compute Engine VM
+#                               (used if running kubectl from a GCE bastion)
+#                               e.g. 34.123.45.67
+#
+#   GCE_SSH_USER              → SSH username for the GCE VM
+#                               e.g. ubuntu  or  your-os-login-username
+#
+# For GKE deployments (recommended), the 'gke_deploy' group runs
+# kubectl commands locally on the CI runner after authenticating via
+# gcloud container clusters get-credentials.
+# 'localhost' means the ansible playbook runs on the GitLab CI runner itself.
+# =============================================================================
+
+# GKE deployment group — runs locally on the CI runner
+[gke_deploy]
+localhost ansible_connection=local
+
+# Legacy GCE bastion group (only needed if kubectl runs on a VM)
+# ⚠️  Replace GCE_INSTANCE_EXTERNAL_IP and GCE_SSH_USER
+[gce_bastion]
+GCE_INSTANCE_EXTERNAL_IP ansible_user=GCE_SSH_USER ansible_ssh_private_key_file=~/.ssh/gce_key
